@@ -1,0 +1,464 @@
+// SPDX-License-Identifier: MIT
+// Minimal board diagnostic screen, v3: binary counters + named-stage lanes.
+//
+// The full BootProgress.c needs the UFS/virtio/cpufreq/touch subsystems that this
+// board does not build, so its archive cannot link here. What the bring-up needs is
+// an unambiguous marker: every boot_progress_stage() call paints into the kernel
+// framebuffer mapping, and the screen spells the counts out in binary so a photo
+// answers "how many events happened" exactly, without counting squares.
+//
+// Screen layout (framebuffer pixels, y grows downward; bands at the very top are
+// painted by the earlier boot chains):
+//
+//   y = h/3       8 bits: number of boot_progress_stage() events   (bit0 at x=16,
+//                 pitch 80, 60x60 squares; white = 1, dark grey = 0)
+//   y = h/3+100   8 bits: number of "bsd_init: " print events
+//   y = h/3+220   named lane 1: the 12 board milestone markers, fixed colour+slot
+//   y = h/3+320   named lane 2: 12 early-startup milestone markers
+//   y = h/2       event row: one white/green square per event, 30 per row, wrapping
+//
+// A photo therefore gives: exact event count (binary), exact bsd_init print count
+// (binary), which board milestones were passed (coloured lane 1) and which early
+// startup milestones were passed (coloured lane 2).
+//
+// No kernel headers are used: boot_progress_bind() already receives the geometry.
+
+#include <stdint.h>
+
+typedef unsigned long bp_ulong;
+
+// 8x8 font, ASCII 32..126. Source: font8x8 by Daniel Hepper (public domain).
+static const unsigned char bp_font[95][8] = {
+	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* 32 space */
+	{ 0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00 }, /* 33 ! */
+	{ 0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* 34 " */
+	{ 0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00 }, /* 35 # */
+	{ 0x0C, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x0C, 0x00 }, /* 36 $ */
+	{ 0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00 }, /* 37 % */
+	{ 0x1C, 0x36, 0x1C, 0x6E, 0x3B, 0x33, 0x6E, 0x00 }, /* 38 & */
+	{ 0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* 39 ' */
+	{ 0x18, 0x0C, 0x06, 0x06, 0x06, 0x0C, 0x18, 0x00 }, /* 40 ( */
+	{ 0x06, 0x0C, 0x18, 0x18, 0x18, 0x0C, 0x06, 0x00 }, /* 41 ) */
+	{ 0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00 }, /* 42 * */
+	{ 0x00, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x00, 0x00 }, /* 43 + */
+	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x06 }, /* 44 , */
+	{ 0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00 }, /* 45 - */
+	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00 }, /* 46 . */
+	{ 0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00 }, /* 47 / */
+	{ 0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00 }, /* 48 0 */
+	{ 0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00 }, /* 49 1 */
+	{ 0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00 }, /* 50 2 */
+	{ 0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00 }, /* 51 3 */
+	{ 0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00 }, /* 52 4 */
+	{ 0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00 }, /* 53 5 */
+	{ 0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00 }, /* 54 6 */
+	{ 0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00 }, /* 55 7 */
+	{ 0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00 }, /* 56 8 */
+	{ 0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00 }, /* 57 9 */
+	{ 0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x00 }, /* 58 : */
+	{ 0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x06 }, /* 59 ; */
+	{ 0x18, 0x0C, 0x06, 0x03, 0x06, 0x0C, 0x18, 0x00 }, /* 60 < */
+	{ 0x00, 0x00, 0x3F, 0x00, 0x00, 0x3F, 0x00, 0x00 }, /* 61 = */
+	{ 0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00 }, /* 62 > */
+	{ 0x1E, 0x33, 0x30, 0x18, 0x0C, 0x00, 0x0C, 0x00 }, /* 63 ? */
+	{ 0x3E, 0x63, 0x7B, 0x7B, 0x7B, 0x03, 0x1E, 0x00 }, /* 64 @ */
+	{ 0x0C, 0x1E, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x00 }, /* 65 A */
+	{ 0x3F, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3F, 0x00 }, /* 66 B */
+	{ 0x3C, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3C, 0x00 }, /* 67 C */
+	{ 0x1F, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1F, 0x00 }, /* 68 D */
+	{ 0x7F, 0x46, 0x16, 0x1E, 0x16, 0x46, 0x7F, 0x00 }, /* 69 E */
+	{ 0x7F, 0x46, 0x16, 0x1E, 0x16, 0x06, 0x0F, 0x00 }, /* 70 F */
+	{ 0x3C, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7C, 0x00 }, /* 71 G */
+	{ 0x33, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x33, 0x00 }, /* 72 H */
+	{ 0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00 }, /* 73 I */
+	{ 0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E, 0x00 }, /* 74 J */
+	{ 0x67, 0x66, 0x36, 0x1E, 0x36, 0x66, 0x67, 0x00 }, /* 75 K */
+	{ 0x0F, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7F, 0x00 }, /* 76 L */
+	{ 0x63, 0x77, 0x7F, 0x7F, 0x6B, 0x63, 0x63, 0x00 }, /* 77 M */
+	{ 0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x00 }, /* 78 N */
+	{ 0x1C, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1C, 0x00 }, /* 79 O */
+	{ 0x3F, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x0F, 0x00 }, /* 80 P */
+	{ 0x1E, 0x33, 0x33, 0x33, 0x3B, 0x1E, 0x38, 0x00 }, /* 81 Q */
+	{ 0x3F, 0x66, 0x66, 0x3E, 0x36, 0x66, 0x67, 0x00 }, /* 82 R */
+	{ 0x1E, 0x33, 0x07, 0x0E, 0x38, 0x33, 0x1E, 0x00 }, /* 83 S */
+	{ 0x3F, 0x2D, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00 }, /* 84 T */
+	{ 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3F, 0x00 }, /* 85 U */
+	{ 0x33, 0x33, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00 }, /* 86 V */
+	{ 0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00 }, /* 87 W */
+	{ 0x63, 0x63, 0x36, 0x1C, 0x1C, 0x36, 0x63, 0x00 }, /* 88 X */
+	{ 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00 }, /* 89 Y */
+	{ 0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00 }, /* 90 Z */
+	{ 0x1E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1E, 0x00 }, /* 91 [ */
+	{ 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00 }, /* 92 \ */
+	{ 0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00 }, /* 93 ] */
+	{ 0x08, 0x1C, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00 }, /* 94 ^ */
+	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF }, /* 95 _ */
+	{ 0x0C, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* 96 ` */
+	{ 0x00, 0x00, 0x1E, 0x30, 0x3E, 0x33, 0x6E, 0x00 }, /* 97 a */
+	{ 0x07, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x3B, 0x00 }, /* 98 b */
+	{ 0x00, 0x00, 0x1E, 0x33, 0x03, 0x33, 0x1E, 0x00 }, /* 99 c */
+	{ 0x38, 0x30, 0x30, 0x3e, 0x33, 0x33, 0x6E, 0x00 }, /* 100 d */
+	{ 0x00, 0x00, 0x1E, 0x33, 0x3f, 0x03, 0x1E, 0x00 }, /* 101 e */
+	{ 0x1C, 0x36, 0x06, 0x0f, 0x06, 0x06, 0x0F, 0x00 }, /* 102 f */
+	{ 0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x1F }, /* 103 g */
+	{ 0x07, 0x06, 0x36, 0x6E, 0x66, 0x66, 0x67, 0x00 }, /* 104 h */
+	{ 0x0C, 0x00, 0x0E, 0x0C, 0x0C, 0x0C, 0x1E, 0x00 }, /* 105 i */
+	{ 0x30, 0x00, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E }, /* 106 j */
+	{ 0x07, 0x06, 0x66, 0x36, 0x1E, 0x36, 0x67, 0x00 }, /* 107 k */
+	{ 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00 }, /* 108 l */
+	{ 0x00, 0x00, 0x33, 0x7F, 0x7F, 0x6B, 0x63, 0x00 }, /* 109 m */
+	{ 0x00, 0x00, 0x1F, 0x33, 0x33, 0x33, 0x33, 0x00 }, /* 110 n */
+	{ 0x00, 0x00, 0x1E, 0x33, 0x33, 0x33, 0x1E, 0x00 }, /* 111 o */
+	{ 0x00, 0x00, 0x3B, 0x66, 0x66, 0x3E, 0x06, 0x0F }, /* 112 p */
+	{ 0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x78 }, /* 113 q */
+	{ 0x00, 0x00, 0x3B, 0x6E, 0x66, 0x06, 0x0F, 0x00 }, /* 114 r */
+	{ 0x00, 0x00, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x00 }, /* 115 s */
+	{ 0x08, 0x0C, 0x3E, 0x0C, 0x0C, 0x2C, 0x18, 0x00 }, /* 116 t */
+	{ 0x00, 0x00, 0x33, 0x33, 0x33, 0x33, 0x6E, 0x00 }, /* 117 u */
+	{ 0x00, 0x00, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00 }, /* 118 v */
+	{ 0x00, 0x00, 0x63, 0x6B, 0x7F, 0x7F, 0x36, 0x00 }, /* 119 w */
+	{ 0x00, 0x00, 0x63, 0x36, 0x1C, 0x36, 0x63, 0x00 }, /* 120 x */
+	{ 0x00, 0x00, 0x33, 0x33, 0x33, 0x3E, 0x30, 0x1F }, /* 121 y */
+	{ 0x00, 0x00, 0x3F, 0x19, 0x0C, 0x26, 0x3F, 0x00 }, /* 122 z */
+	{ 0x38, 0x0C, 0x0C, 0x07, 0x0C, 0x0C, 0x38, 0x00 }, /* 123 { */
+	{ 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00 }, /* 124 | */
+	{ 0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00 }, /* 125 } */
+	{ 0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* 126 ~ */
+};
+
+static struct {
+	uintptr_t base;
+	unsigned  width;
+	unsigned  height;
+	unsigned  rowbytes;
+	unsigned  depth;
+	int       bound;
+	unsigned  stages;
+	unsigned  bsd_prints;
+	unsigned  named_seen;
+	unsigned  named_seen2;
+	unsigned  tx;
+	unsigned  ty;
+} gScreen;
+
+void boot_progress_init(void);
+void boot_progress_start(void);
+int  boot_progress_active(void);
+void boot_progress_bind(uintptr_t, unsigned, unsigned, unsigned, unsigned);
+void boot_progress_putc(char);
+void boot_progress_stage(const char *);
+void boot_progress_irq(uint64_t, uint64_t, uint64_t);
+void boot_progress_poll(void);
+void boot_progress_user_breakpoint(void *, unsigned);
+void boot_progress_user_abort(void *, unsigned, uint64_t);
+void boot_progress_critical_exit(int, char *, bp_ulong);
+void boot_progress_process_stage(int, const char *, const char *);
+void boot_progress_exit(int, const char *, int, unsigned, uint64_t);
+
+// Lane 1: board milestones added by the boot-progress patch.
+static const char *const bp_lane1[] = {
+	"arm_vm_init enter",
+	"arm_vm_init returned",
+	"bsd_init enter",
+	"original PMGR nub start",
+	"original PMGR nub returned",
+	"vfs_mountroot enter",
+	"vfs_mountroot mounted",
+	"root authentication decision recorded",
+	"load_init_program enter",
+	"SystemOS mount enter",
+	"Data mount enter",
+	"temporary watchdog launch policy enter",
+};
+
+// Lane 2: early startup messages from kernel_bootstrap()/kernel_bootstrap_thread().
+static const char *const bp_lane2[] = {
+	"vm_mem_bootstrap",
+	"console_init",
+	"machine_init",
+	"clock_init",
+	"code_signing_init",
+	"thread_init",
+	"workq_init",
+	"exception_init",
+	"kernel_thread_create",
+	"idle_thread_create",
+	"sched_startup",
+	"clock_service_create",
+};
+
+static const uint32_t bp_lane1_colour[] = {
+	0xFFFFA500u,	// orange      arm_vm_init enter
+	0xFF8A2BE2u,	// violet      arm_vm_init returned
+	0xFFFFFF00u,	// yellow      bsd_init enter
+	0xFFFF8C00u,	// dark orange PMGR start
+	0xFF32CD32u,	// lime        PMGR returned
+	0xFFFF00FFu,	// magenta     vfs_mountroot enter
+	0xFFFF0000u,	// red         vfs_mountroot mounted
+	0xFFFFFFFFu,	// white       root auth recorded
+	0xFF00FFFFu,	// cyan        load_init_program enter
+	0xFF008080u,	// teal        SystemOS mount enter
+	0xFF808000u,	// olive       Data mount enter
+	0xFFFFC0CBu,	// pink        watchdog policy enter
+};
+
+static const uint32_t bp_lane2_colour[] = {
+	0xFFFFFFFFu,	// white
+	0xFF00FF00u,	// green
+	0xFFFFFF00u,	// yellow
+	0xFFFF8C00u,	// dark orange
+	0xFFFF00FFu,	// magenta
+	0xFF00FFFFu,	// cyan
+	0xFF32CD32u,	// lime
+	0xFF8A2BE2u,	// violet
+	0xFFFF0000u,	// red
+	0xFF008080u,	// teal
+	0xFF808000u,	// olive
+	0xFFFFA500u,	// orange
+};
+
+#define BP_LANE1_COUNT (sizeof(bp_lane1) / sizeof(bp_lane1[0]))
+#define BP_LANE2_COUNT (sizeof(bp_lane2) / sizeof(bp_lane2[0]))
+#define BP_ROW_SLOTS 30u
+#define BP_MARKER 34u
+#define BP_GAP 10u
+#define BP_BITS 8u
+#define BP_DIM 0xFF303030u
+
+static void bp_pixel(unsigned x, unsigned y, uint32_t colour)
+{
+	volatile uint32_t *at;
+
+	if (!gScreen.bound || x >= gScreen.width || y >= gScreen.height) {
+		return;
+	}
+	at = (volatile uint32_t *)(gScreen.base + (uint64_t)y * gScreen.rowbytes + (uint64_t)x * 4);
+	*at = colour;
+}
+
+static void bp_rect(unsigned x0, unsigned y0, unsigned w, unsigned h, uint32_t colour)
+{
+	unsigned x, y;
+
+	for (y = 0; y < h; ++y) {
+		for (x = 0; x < w; ++x) {
+			bp_pixel(x0 + x, y0 + y, colour);
+		}
+	}
+}
+
+static int bp_prefix(const char *text, const char *prefix)
+{
+	if (text == 0 || prefix == 0) {
+		return 0;
+	}
+	while (*prefix != '\0') {
+		if (*text != *prefix) {
+			return 0;
+		}
+		++text;
+		++prefix;
+	}
+	return 1;
+}
+
+// Eight squares spell a count in binary: bit0 leftmost, white = 1, dark grey = 0.
+static void bp_bits(unsigned value, unsigned y)
+{
+	unsigned i;
+
+	for (i = 0; i < BP_BITS; ++i) {
+		uint32_t colour = ((value >> i) & 1u) ? 0xFFFFFFFFu : BP_DIM;
+		bp_rect(16 + i * 80, y, 60, 60, colour);
+	}
+}
+
+static void bp_marker(unsigned n)
+{
+	unsigned row = n / BP_ROW_SLOTS;
+	unsigned col = n % BP_ROW_SLOTS;
+	unsigned x = 16 + col * (BP_MARKER + BP_GAP);
+	unsigned y = gScreen.height / 2 + row * (BP_MARKER + 16);
+	uint32_t colour = (n & 1u) ? 0xFF00FF00u : 0xFFFFFFFFu;
+
+	bp_rect(x, y, BP_MARKER, BP_MARKER, colour);
+}
+
+static void bp_lane(const char *text, const char *const *names, const uint32_t *colours,
+    unsigned count, unsigned *seen, unsigned y)
+{
+	unsigned i;
+
+	if (!gScreen.bound) {
+		return;
+	}
+	for (i = 0; i < count; ++i) {
+		if ((*seen & (1u << i)) != 0) {
+			continue;
+		}
+		if (bp_prefix(text, names[i])) {
+			*seen |= 1u << i;
+			bp_rect(16 + i * 94, y, 56, 56, colours[i]);
+			return;
+		}
+	}
+}
+
+static void bp_newline(void)
+{
+	unsigned base = gScreen.height / 2 + 130;
+	unsigned limit = gScreen.height > 24 ? gScreen.height - 16 : gScreen.height;
+
+	gScreen.tx = 16;
+	gScreen.ty += 10;
+	if (gScreen.ty > limit) {
+		gScreen.ty = base;
+	}
+}
+
+static void bp_char(char c)
+{
+	const unsigned char *glyph;
+	unsigned row, bit;
+
+	if (c < 32 || c > 126) {
+		c = '?';
+	}
+	glyph = bp_font[(unsigned)(c - 32)];
+	if (gScreen.tx + 8 >= gScreen.width) {
+		bp_newline();
+	}
+	for (row = 0; row < 8; ++row) {
+		unsigned char bits = glyph[row];
+		unsigned y = gScreen.ty + row;
+
+		if (y >= gScreen.height) {
+			break;
+		}
+		for (bit = 0; bit < 8; ++bit) {
+			if ((bits & (1u << bit)) != 0) {
+				bp_pixel(gScreen.tx + bit, y, 0xFFFFFFFFu);
+			}
+		}
+	}
+	gScreen.tx += 8;
+}
+
+void boot_progress_init(void)
+{
+	gScreen.stages = 0;
+	gScreen.bsd_prints = 0;
+	gScreen.named_seen = 0;
+	gScreen.named_seen2 = 0;
+	gScreen.tx = 16;
+	gScreen.ty = gScreen.height / 2 + 130;
+}
+
+void boot_progress_start(void)
+{
+	bp_marker(0);
+}
+
+int boot_progress_active(void)
+{
+	return gScreen.bound;
+}
+
+void boot_progress_bind(uintptr_t base, unsigned w, unsigned h, unsigned rb, unsigned depth)
+{
+	if (base == 0 || depth != 32 || w < 64 || h < 64 || rb < w * 4) {
+		return;
+	}
+	gScreen.base = base;
+	gScreen.width = w;
+	gScreen.height = h;
+	gScreen.rowbytes = rb;
+	gScreen.depth = depth;
+	gScreen.bound = 1;
+	// Red corner: proof that the kernel bound the framebuffer and this screen is drawing.
+	bp_rect(8, 8, 48, 48, 0xFFFF0000u);
+}
+
+// The patched PE_init_kprintf() hands every kprintf character (including the
+// panic text) to this hook while the diagnostic screen is bound. Draw it, so a
+// swallowed panic message becomes visible instead of a silent stop.
+void boot_progress_putc(char c)
+{
+	if (!gScreen.bound) {
+		return;
+	}
+	if (c == '\n') {
+		bp_newline();
+		return;
+	}
+	if (c == '\r') {
+		return;
+	}
+	bp_char(c);
+}
+
+void boot_progress_stage(const char *text)
+{
+	bp_lane(text, bp_lane1, bp_lane1_colour, BP_LANE1_COUNT, &gScreen.named_seen,
+	    gScreen.height / 3 + 220);
+	bp_lane(text, bp_lane2, bp_lane2_colour, BP_LANE2_COUNT, &gScreen.named_seen2,
+	    gScreen.height / 3 + 320);
+	if (bp_prefix(text, "bsd_init: ")) {
+		++gScreen.bsd_prints;
+		bp_bits(gScreen.bsd_prints, gScreen.height / 3 + 100);
+	}
+	bp_marker(++gScreen.stages);
+	bp_bits(gScreen.stages, gScreen.height / 3);
+}
+
+void boot_progress_process_stage(int pid, const char *name, const char *text)
+{
+	(void)pid;
+	(void)name;
+	bp_lane(text, bp_lane1, bp_lane1_colour, BP_LANE1_COUNT, &gScreen.named_seen,
+	    gScreen.height / 3 + 220);
+	bp_lane(text, bp_lane2, bp_lane2_colour, BP_LANE2_COUNT, &gScreen.named_seen2,
+	    gScreen.height / 3 + 320);
+	bp_marker(++gScreen.stages);
+	bp_bits(gScreen.stages, gScreen.height / 3);
+}
+
+void boot_progress_irq(uint64_t a, uint64_t b, uint64_t c)
+{
+	(void)a;
+	(void)b;
+	(void)c;
+}
+
+void boot_progress_poll(void)
+{
+}
+
+void boot_progress_user_breakpoint(void *a, unsigned b)
+{
+	(void)a;
+	(void)b;
+}
+
+void boot_progress_user_abort(void *a, unsigned b, uint64_t c)
+{
+	(void)a;
+	(void)b;
+	(void)c;
+}
+
+void boot_progress_critical_exit(int a, char *b, bp_ulong c)
+{
+	(void)a;
+	(void)b;
+	(void)c;
+}
+
+void boot_progress_exit(int a, const char *b, int c, unsigned d, uint64_t e)
+{
+	(void)a;
+	(void)b;
+	(void)c;
+	(void)d;
+	(void)e;
+}
