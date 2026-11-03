@@ -66,6 +66,10 @@ jobs:
       - name: Check out UniXNU
         uses: actions/checkout@v4
         with:
+          # 必须 checkout UniXNU 上游本体。缺省 checkout 会拿本仓库（设备仓库）当成 UniXNU，
+          # 于是既没有 ./unixnu 也没有 scripts/unixnu —— 这是 v1 失败的原因。
+          repository: UniXNU/UniXNU
+          path: unixnu
           persist-credentials: false
 
       - name: Check out the device repository
@@ -74,6 +78,15 @@ jobs:
           repository: ${{ inputs.device_repository }}
           ref: ${{ inputs.device_ref }}
           path: device
+
+      - name: Link the device into the UniXNU tree
+        # 其余所有步骤都在 unixnu/ 下跑，-D 指向这份链接，所以 fetch/defconfig/build 用的是同一个 device。
+        run: |
+          set -euo pipefail
+          test -f unixnu/unixnu
+          ln -sfn "$GITHUB_WORKSPACE/device" unixnu/device
+          ls unixnu/ | head -20
+          echo "unixnu command: $(head -1 unixnu/unixnu)"; ls unixnu/scripts/unixnu | head -5
 
       - uses: actions/setup-python@v5
         with:
@@ -120,6 +133,7 @@ jobs:
       - name: Drop stale XNU-10063 OS patches
         # iOS 27 profile 的 OS 层 series 仍引用 10063 时代的 zzz-boot-progress.patch，它只是诊断输出，
         # 在 12377 上打不上，会直接中断补丁链。
+        working-directory: unixnu
         run: |
           set -euo pipefail
           f=$(ls profiles/os/ipados-"${OS_MAJOR}"*/patches/xnu/series 2>/dev/null | head -1 || true)
@@ -131,10 +145,11 @@ jobs:
 
       - name: Check the inputs
         id: check
+        working-directory: unixnu
         run: |
           set -euo pipefail
-          [ -f device/board.toml ] || { echo "::error::the device repository has no board.toml"; exit 1; }
-          [ -f "device/configs/$DEFCONFIG" ] || { echo "::error::device/configs/$DEFCONFIG missing"; exit 1; }
+          [ -f ../device/board.toml ] || { echo "::error::the device repository has no board.toml"; exit 1; }
+          [ -f "../device/configs/$DEFCONFIG" ] || { echo "::error::device/configs/$DEFCONFIG missing"; exit 1; }
           [ -d "$DEVELOPER_DIR" ] || { echo "::error::Xcode not found at $DEVELOPER_DIR"; ls /Applications | head; exit 1; }
           python3 - <<'PY'
           import os, sys
@@ -150,6 +165,7 @@ jobs:
           PY
 
       - name: Install host tools
+        working-directory: unixnu
         run: |
           brew install llvm lld mtools dtc
           if ! command -v unifdef >/dev/null; then
@@ -160,23 +176,28 @@ jobs:
           python3 --version
 
       - name: Fetch device modules
+        working-directory: unixnu
         run: ./unixnu fetch --os "$OS_MAJOR" -D "$UNIXNU_DEVICE"
 
       - name: Defconfig
+        working-directory: unixnu
         run: ./unixnu defconfig "$DEFCONFIG" --os "$OS_MAJOR" -D "$UNIXNU_DEVICE"
 
       - name: Build kernel
         # `build kernel` 先跑 bootstrap 只取编译记录，再建归档、正式编译并 prelink，不需要手动两遍。
+        working-directory: unixnu
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: ./unixnu build kernel --os "$OS_MAJOR"
 
       - name: Build userdata
         if: contains(inputs.steps, 'userdata')
+        working-directory: unixnu
         run: ./unixnu build userdata --os "$OS_MAJOR"
 
       - name: Build payload
         if: contains(inputs.steps, 'payload')
+        working-directory: unixnu
         run: ./unixnu build payload --os "$OS_MAJOR"
 
       - name: Preflight (payload size)
