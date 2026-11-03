@@ -10,7 +10,7 @@
 "soc_source" = "sm8550"
 "os_profile" = "ipados-27.0.1-24A446"
 ["components"]
-"include" = ["ArmDTPlatform", "ArmCpu", "ShengUfs", "VirtioMmioBlock", "RamBlock", "VerifiedRoot", "XnuPrelink"]
+"include" = ["ArmDTPlatform", "ArmCpu", "VirtioMmioBlock", "RamBlock", "VerifiedRoot", "XnuPrelink"]
 ["userdata"]
 "first_lba" = 2260480
 "last_lba" = 64049146
@@ -25,7 +25,6 @@
   "build-mockfs-fixture.py",
   "component:ArmDTPlatform",
   "component:ArmCpu",
-  "component:ShengUfs",
   "component:VirtioMmioBlock",
   "component:RamBlock",
 ]
