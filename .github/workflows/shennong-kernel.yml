@@ -182,7 +182,32 @@ jobs:
       - name: Defconfig
         working-directory: unixnu
         run: ./unixnu defconfig "$DEFCONFIG" --os "$OS_MAJOR" -D "$UNIXNU_DEVICE"
-
+        
+      - name: Allow arm64e in the XnuPrelink Mach-O reader
+        # iOS 26/27 的内核产物是 arm64e（subtype 2），而 kits/XnuPrelink/native_prelink.py 只认
+        # subtype 0，会在 build-sheng-platform-power 里报 "Only ordinary little-endian ARM64 is supported"。
+        working-directory: unixnu
+        run: |
+          set -euo pipefail
+          f=kits/XnuPrelink/native_prelink.py
+          test -f "$f"
+          python3 - "$f" <<'PY'
+          import sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          old = "if (magic, cpu, subtype) != (0xfeedfacf, 0x100000c, 0):"
+          new = "if magic != 0xfeedfacf or cpu != 0x100000c or subtype not in (0, 2):"
+          if old in text:
+              path.write_text(text.replace(old, new, 1))
+              print("patched: arm64e subtype 2 now accepted")
+          elif new in text:
+              print("already patched")
+          else:
+              sys.exit("anchor not found in kits/XnuPrelink/native_prelink.py -- upstream changed, inspect manually")
+          PY
+          grep -n "subtype not in (0, 2)" "$f"
+          
       - name: Build kernel
         # `build kernel` 先跑 bootstrap 只取编译记录，再建归档、正式编译并 prelink，不需要手动两遍。
         working-directory: unixnu
