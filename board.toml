@@ -8,7 +8,7 @@
 "description" = "Xiaomi 14 Pro 23116PN5BC"
 "kit" = "shennong"
 "soc_source" = "sm8550"
-"os_profile" = "ipados-17.7.11-21H461"
+"os_profile" = "ipados-27.0.1-24A446"
 ["components"]
 "include" = ["ArmDTPlatform", "ArmCpu", "ShengUfs", "VirtioMmioBlock", "RamBlock", "VerifiedRoot", "XnuPrelink"]
 ["userdata"]
