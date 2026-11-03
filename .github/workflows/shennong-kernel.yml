@@ -207,6 +207,24 @@ jobs:
               sys.exit("anchor not found in kits/XnuPrelink/native_prelink.py -- upstream changed, inspect manually")
           PY
           grep -n "subtype not in (0, 2)" "$f"
+
+      - name: Audit the XNU component builders for arm64e
+        # 内核产物是 arm64e（Mach-O subtype 2）。scripts/ 下几个 python 构建器要解析内核
+        # Mach-O；只认 subtype 0 的会在 Build kernel 里失败。本步只体检、打印，不改文件。
+        working-directory: unixnu
+        run: |
+          set -uo pipefail
+          for f in scripts/build-sheng-platform-power.py scripts/build-mockfs-fixture.py \
+                   scripts/build-corecrypto-14.py scripts/build-libpthread-kernel.py; do
+            [ -f "$f" ] || { echo "absent: $f"; continue; }
+            hits=$(grep -nE "0x100000c|subtype|feedfacf" "$f" || true)
+            if [ -n "$hits" ]; then
+              echo "--- $f"; echo "$hits" | sed 's/^/    /'
+            else
+              echo "--- $f (no Mach-O constants)"
+            fi
+            python3 -c "import sys,py_compile;py_compile.compile(sys.argv[1],sys.argv[1],'exec')" "$f" || echo "::error::$f does not compile"
+          done
           
       - name: Build kernel
         # `build kernel` 先跑 bootstrap 只取编译记录，再建归档、正式编译并 prelink，不需要手动两遍。

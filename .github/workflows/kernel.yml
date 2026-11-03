@@ -1,326 +1,299 @@
-name: shennong kernel
+name: shennong kernel (private)
+
+# 小米14 Pro (shennong / SM8650) —— XNU + payload 构建，upstream 构建流程 + 产物下载。
+# 放在你自己的 UniXNU 私有 fork 里：.github/workflows/shennong-kernel.yml
+# 产物含 Apple 派生二进制，只能放在私有仓库，不要公开分发。
+#
+# v2 (2026-11-04)：设备仓库补丁没放对位置时自动搬正；iOS 27 profile 的 10063 诊断补丁自动跳过。
+
 on:
   workflow_dispatch:
+    inputs:
+      device_repository:
+        description: 设备仓库 owner/name
+        required: true
+        default: baihem/UniXNU-shennong
+      device_ref:
+        description: 设备仓库分支/提交
+        required: true
+        default: main
+      os_major:
+        description: 目标 OS 大版本（26 / 27）
+        type: choice
+        options: ["27", "26"]
+        default: "27"
+      steps:
+        description: 构建到哪一步
+        type: choice
+        options:
+          - kernel
+          - kernel payload
+          - kernel userdata
+          - kernel userdata payload
+        default: kernel payload
+      xcode:
+        description: macos-26 镜像的 Xcode 版本（/Applications/Xcode_<version>.app）
+        required: true
+        default: "26.6"
+
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: shennong-${{ github.ref }}-${{ inputs.os_major }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  kernel:
+  build:
     runs-on: macos-26
     timeout-minutes: 360
     env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
       UNIXNU_DEVICE: ${{ github.workspace }}/device
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DEFCONFIG: shennong_defconfig
+      STEPS: ${{ inputs.steps }}
+      OS_MAJOR: ${{ inputs.os_major }}
     steps:
       - name: Check out UniXNU
         uses: actions/checkout@v4
         with:
+          # 必须 checkout UniXNU 上游本体。缺省 checkout 会拿本仓库（设备仓库）当成 UniXNU，
+          # 于是既没有 ./unixnu 也没有 scripts/unixnu —— 这是 v1 失败的原因。
           repository: UniXNU/UniXNU
-          ref: main
           path: unixnu
-          submodules: recursive
-      - name: Check out uefi-sheng (panic screen font)
-        uses: actions/checkout@v4
-        with:
-          repository: UniXNU/uefi-sheng
-          ref: sheng
-          path: uefi
+          persist-credentials: false
+
       - name: Check out the device repository
         uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.device_repository }}
+          ref: ${{ inputs.device_ref }}
           path: device
+
+      - name: Link the device into the UniXNU tree
+        # 其余所有步骤都在 unixnu/ 下跑，-D 指向这份链接，所以 fetch/defconfig/build 用的是同一个 device。
+        run: |
+          set -euo pipefail
+          test -f unixnu/unixnu
+          ln -sfn "$GITHUB_WORKSPACE/device" unixnu/device
+          ls unixnu/ | head -20
+          echo "unixnu command: $(head -1 unixnu/unixnu)"; ls unixnu/scripts/unixnu | head -5
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      - name: Normalize the device patches
+        # 网页上传经常把补丁放错层（patches/xnu/ 或仓库根目录）。这里按 board.toml 的要求摆正：
+        #   patches/xnu-12377/series 存在就直接用；否则用 patches/xnu/series 里引用的补丁建一份。
+        run: |
+          set -euo pipefail
+          cd device
+          grep -n 'patch_series' board.toml || true
+          if [ ! -f patches/xnu-12377/series ]; then
+            echo "::warning::device repo has no patches/xnu-12377/series; deriving it from patches/xnu/series"
+            mkdir -p patches/xnu-12377
+            rc=0
+            while IFS= read -r line; do
+              line="${line%%$'\r'}"
+              case "$line" in ''|'#'*) continue;; esac
+              echo "  series entry: $line"
+              src=""
+              for cand in "patches/xnu-12377/$line" "patches/xnu/$line" "$line"; do
+                if [ -f "$cand" ]; then src="$cand"; break; fi
+              done
+              if [ -z "$src" ]; then
+                echo "::error::series references '$line' but the file is nowhere in the device repo"
+                rc=1
+                continue
+              fi
+              cp "$src" "patches/xnu-12377/$line"
+            done < patches/xnu/series
+            [ "$rc" = 0 ] || exit 1
+            cp patches/xnu/series patches/xnu-12377/series
+          fi
+          echo "--- patches/xnu-12377/series"
+          cat patches/xnu-12377/series
+          for f in patches/xnu-12377/*.patch; do
+            echo "--- $f ($(wc -l < "$f") lines)"
+            head -3 "$f"
+          done
+          grep -q 'patches/xnu-12377/series' board.toml || {
+            echo "::error::board.toml does not point at patches/xnu-12377/series (upload the updated board.toml)"; exit 1; }
+
+      - name: Drop stale XNU-10063 OS patches
+        # iOS 27 profile 的 OS 层 series 仍引用 10063 时代的 zzz-boot-progress.patch，它只是诊断输出，
+        # 在 12377 上打不上，会直接中断补丁链。
+        working-directory: unixnu
+        run: |
+          set -euo pipefail
+          f=$(ls profiles/os/ipados-"${OS_MAJOR}"*/patches/xnu/series 2>/dev/null | head -1 || true)
+          if [ -n "$f" ]; then
+            echo "OS patch series: $f"
+            cp "$f" "$f.orig"
+            printf '# intentionally empty: the xnu-10063 diagnostics (zzz-boot-progress) do not apply to xnu-12377\n' > "$f"
+          fi
+
+      - name: Check the inputs
+        id: check
+        working-directory: unixnu
+        run: |
+          set -euo pipefail
+          [ -f ../device/board.toml ] || { echo "::error::the device repository has no board.toml"; exit 1; }
+          [ -f "../device/configs/$DEFCONFIG" ] || { echo "::error::device/configs/$DEFCONFIG missing"; exit 1; }
+          [ -d "$DEVELOPER_DIR" ] || { echo "::error::Xcode not found at $DEVELOPER_DIR"; ls /Applications | head; exit 1; }
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from unixnu.cli import parser, cmd_defconfig
+          from unixnu.config import Context
+          ctx = Context(parser().parse_args(['defconfig', os.environ['DEFCONFIG'], '--os', os.environ['OS_MAJOR']]))
+          cmd_defconfig(ctx)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'board={ctx.board["board"]["name"]}\n')
+              out.write(f'work={ctx.work}\n')
+          print('profile:', ctx.board['board']['os_profile'], '->', ctx.work)
+          PY
+
       - name: Install host tools
+        working-directory: unixnu
         run: |
           brew install llvm lld mtools dtc
-          if ! command -v unifdef >/dev/null; then brew install unifdef; echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"; fi
+          if ! command -v unifdef >/dev/null; then
+            brew install unifdef
+            echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+          fi
+          xcodebuild -version
+          python3 --version
+
       - name: Fetch device modules
         working-directory: unixnu
-        run: ./unixnu fetch -D "$UNIXNU_DEVICE"
+        run: ./unixnu fetch --os "$OS_MAJOR" -D "$UNIXNU_DEVICE"
+
       - name: Defconfig
         working-directory: unixnu
-        run: ./unixnu defconfig shennong_defconfig -D "$UNIXNU_DEVICE"
+        run: ./unixnu defconfig "$DEFCONFIG" --os "$OS_MAJOR" -D "$UNIXNU_DEVICE"
+        
+      - name: Allow arm64e in the XnuPrelink Mach-O reader
+        # iOS 26/27 的内核产物是 arm64e（subtype 2），而 kits/XnuPrelink/native_prelink.py 只认
+        # subtype 0，会在 build-sheng-platform-power 里报 "Only ordinary little-endian ARM64 is supported"。
+        working-directory: unixnu
+        run: |
+          set -euo pipefail
+          f=kits/XnuPrelink/native_prelink.py
+          test -f "$f"
+          python3 - "$f" <<'PY'
+          import sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          old = "if (magic, cpu, subtype) != (0xfeedfacf, 0x100000c, 0):"
+          new = "if magic != 0xfeedfacf or cpu != 0x100000c or subtype not in (0, 2):"
+          if old in text:
+              path.write_text(text.replace(old, new, 1))
+              print("patched: arm64e subtype 2 now accepted")
+          elif new in text:
+              print("already patched")
+          else:
+              sys.exit("anchor not found in kits/XnuPrelink/native_prelink.py -- upstream changed, inspect manually")
+          PY
+          grep -n "subtype not in (0, 2)" "$f"
+
+      - name: Audit the XNU component builders for arm64e
+        # 内核产物是 arm64e（Mach-O subtype 2）。scripts/ 下几个 python 构建器要解析内核
+        # Mach-O；只认 subtype 0 的会在 Build kernel 里失败。本步只体检、打印，不改文件。
+        working-directory: unixnu
+        run: |
+          set -uo pipefail
+          for f in scripts/build-sheng-platform-power.py scripts/build-mockfs-fixture.py \
+                   scripts/build-corecrypto-14.py scripts/build-libpthread-kernel.py; do
+            [ -f "$f" ] || { echo "absent: $f"; continue; }
+            hits=$(grep -nE "0x100000c|subtype|feedfacf" "$f" || true)
+            if [ -n "$hits" ]; then
+              echo "--- $f"; echo "$hits" | sed 's/^/    /'
+            else
+              echo "--- $f (no Mach-O constants)"
+            fi
+            python3 -c "import sys,py_compile;py_compile.compile(sys.argv[1],sys.argv[1],'exec')" "$f" || echo "::error::$f does not compile"
+          done
+          
       - name: Build kernel
+        # `build kernel` 先跑 bootstrap 只取编译记录，再建归档、正式编译并 prelink，不需要手动两遍。
         working-directory: unixnu
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          UNIXNU_UEFI: ${{ github.workspace }}/uefi
-        run: |
-          trap 'echo "::error::Build kernel failed at line $LINENO: $BASH_COMMAND"' ERR
-          SRC_SCRIPT=scripts/build-xnu-4k-baseline.sh
-          # symbols helper must tolerate objects the failed link pass removed
-          SYMFILE=scripts/xnu_symbols.py
-          if [ -f "$SYMFILE" ] && ! grep -q 'if Path(path).is_file()' "$SYMFILE"; then
-            sed -i '' 's|paths = \[str(path) for path in paths\]|paths = [str(path) for path in paths if Path(path).is_file()]|' "$SYMFILE" || true
-          fi
-          echo "symbols-helper patched: $(grep -c 'if Path(path).is_file()' "$SYMFILE" || true)"
-          # The diagnostic screen is gated on the audited UFS/owner-root build, which this board
-          # does not run yet. The screen only needs the stage/console/panic display, so relax that
-          # gate for this board and say so in the log.
-          if grep -q 'Boot progress requires the audited' "$SRC_SCRIPT"; then
-            sed -i '' 's/^  if \[ "\${XNU_NATIVE_UFS:-0}" != 1 \].*/  if false; then/' "$SRC_SCRIPT" || true
-            sed -i '' '/^     \[ "\${XNU_SOURCE_CORECRYPTO14:-0}" != 1 \]; then$/d' "$SRC_SCRIPT" || true
-            echo "boot-progress gate patched: $(grep -c 'if false; then' "$SRC_SCRIPT" || true)"
-          fi
-          if ./unixnu build kernel; then
-            FIRST_RC=0
-            echo "first pass rc=0"
-          else
-            FIRST_RC=$?
-            echo "::warning::first pass rc=$FIRST_RC (bootstrap; expected to fail only while libShengPlatformPower.a is absent)"
-          fi
-          TREE=$(ls -d out/shennong/*/shennong/tree 2>/dev/null | head -1)
-          echo "tree=$TREE"
-          test -d "$TREE" || exit 1
-          mkdir -p "$TREE/drivers"
-          if [ ! -f "$TREE/drivers/ShengUfs/NativeUfs.cpp" ]; then
-            rm -rf "$TREE/drivers/ShengUfs"
-            git clone --depth 1 https://github.com/UniXNU/NativeUfs.git "$TREE/drivers/ShengUfs" || true
-          fi
-          git clone --depth 1 https://github.com/UniXNU/VerifiedRoot.git /tmp/VerifiedRoot || true
-          cp /tmp/VerifiedRoot/verified_root.h /tmp/VerifiedRoot/VerifiedBlockPolicy.h "$TREE/drivers/ShengUfs/". 2>/dev/null || true
-          ls "$TREE/drivers/ShengUfs/" | head -20
-          export PATH="$(brew --prefix llvm)/bin:$PATH"
-          if ! python3 "$TREE/scripts/build-sheng-platform-power.py" > /tmp/bsp.out 2>&1; then
-            echo "::error::build-sheng-platform-power failed"
-            tail -8 /tmp/bsp.out | sed 's/^/::error::/'
-            tail -6 /tmp/bsp.out
-          fi
-          if [ -f "$TREE/scripts/build-mockfs-fixture.py" ]; then
-            python3 "$TREE/scripts/build-mockfs-fixture.py" || echo "::warning::mockfs fixture build failed"
-          else
-            echo "mockfs fixture script absent (MOCKFS not enabled for this profile)"
-          fi
-          tail -3 "$TREE/drivers/ShengUfs/NativeUfs.cpp"
-          echo "=== STORAGE ABI AUDIT ==="
-          python3 "$TREE/scripts/audit-storage-interface.py" || echo "audit failed"
-          echo "=== AUDIT END ==="
-          if ! ./unixnu build kernel; then SECOND_RC=1; else SECOND_RC=0; fi
-          echo "second pass rc=$SECOND_RC"
-          echo "=== LINK ARGS DUMP ==="
-          for f in $(find "$TREE" -name '*.linkarguments' 2>/dev/null | head -3); do
-            echo "--- $f"
-            echo "dynamic_lookup_count=$(grep -o 'dynamic_lookup' "$f" | wc -l)"
-            head -c 700 "$f"
-            echo
-          done
-          echo "=== DUMP END ==="
-          for f in "$TREE"/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837*; do
-            [ -f "$f" ] && echo "macho $(basename "$f") $(wc -c < "$f") bytes"
-          done
-          echo "::error::mock tree=$TREE"
-          echo "::error::mock mode=$(cat "$TREE/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/.source-mockfs-mode" 2>/dev/null || echo unset)"
-          echo "::error::mock fixture=$(ls "$TREE/build/mockfs-fixture/" 2>/dev/null | tr '\n' ',')"
-          echo "::error::mock cfg=$(find out -maxdepth 5 -name '.config' 2>/dev/null | head -1)"
-          for f in $(find out -maxdepth 5 -name '.config' 2>/dev/null | head -1); do
-            grep -E 'MOCKFS|NATIVE_UFS|SOURCE_PTHREAD' "$f" | sed 's/^/::error::mock key /'
-          done
-          exit $SECOND_RC
-      - name: Report failure details
-        if: failure()
+        run: ./unixnu build kernel --os "$OS_MAJOR"
+
+      - name: Build userdata
+        if: contains(inputs.steps, 'userdata')
         working-directory: unixnu
-        run: |
-          python3 - <<'PY'
-          import glob, os
-          def esc(s):
-              return s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
-          parts = []
-          logs = sorted(glob.glob('out/shennong/**/*.log', recursive=True), key=os.path.getmtime, reverse=True)
-          parts.append('LOGS n=%d first=%s' % (len(logs), ','.join(os.path.basename(x) for x in logs[:4])))
-          if os.path.exists('/tmp/bsp.out'):
-              parts.append('== bsp.tail')
-              parts.append(open('/tmp/bsp.out', errors='replace').read()[-1200:])
-          kl = [p for p in logs if p.endswith('/logs/kernel.log')]
-          for p in kl[:1]:
-              t = open(p, errors='replace').read()
-              i = t.find('Undefined symbols')
-              parts.append('== kernel.log len=%d undef_at=%d' % (len(t), i))
-              if i >= 0:
-                  parts.append(t[i:i + 2200])
-              parts.append('== kernel.tail')
-              parts.append('\n'.join(t.splitlines()[-50:]))
-          for f in glob.glob('out/shennong/*/*/shennong/tree/.cache/xnu-work/osfmk/conf/files'):
-              for n, line in enumerate(open(f, errors='replace'), 1):
-                  if 'vm_tests.c' in line:
-                      parts.append('conf/files:%d %s' % (n, line.strip()))
-          for f in glob.glob('out/shennong/*/*/shennong/tree/.cache/xnu-work/makedefs/MakeInc.kernel'):
-              c = open(f, errors='replace').read()
-              parts.append('MakeInc.kernel dyn=%d newlinker=%d' % (c.count('dynamic_lookup'), c.count('new_linker')))
-          blob = '\n'.join(parts)
-          print('report bytes', len(blob))
-          for k in range(0, min(len(blob), 11000), 3800):
-              print('::error::' + esc(blob[k:k + 3800]))
-          PY
-          cd "$GITHUB_WORKSPACE/device"
-          mkdir -p ci-logs
-          cp -f ../unixnu/out/shennong/*/*/logs/*.log ci-logs/ 2>/dev/null || true
-          cp -f /tmp/bsp.out ci-logs/ 2>/dev/null || true
-          : > ci-logs/errors.txt
-          for f in $(grep -rl -i -E 'error:|Error 1|fatal error' ../unixnu/out/shennong/*/*/shennong/tree/build --include='*.log' 2>/dev/null | head -12); do
-            echo "### $f" >> ci-logs/errors.txt
-            tail -25 "$f" >> ci-logs/errors.txt
-          done
-          if [ -s ci-logs/errors.txt ]; then
-            tail -60 ci-logs/errors.txt | sed 's/^/::error::/'
-          fi
-          ls ci-logs | head -8
-          git config user.name ci-bot
-          git config user.email ci-bot@local
-          git checkout -b "ci-logs-$GITHUB_RUN_ID" 2>/dev/null || git checkout "ci-logs-$GITHUB_RUN_ID"
-          git add -f ci-logs
-          git commit -m "ci: logs for run $GITHUB_RUN_ID" || echo nothing-to-commit
-          git push --force origin "HEAD:refs/heads/ci-logs-$GITHUB_RUN_ID" || echo push-failed
-      - name: Build ShengUfs archive for probing
-        if: always()
-        working-directory: unixnu
-        run: |
-          set +e
-          TREE=$(ls -d out/shennong/*/shennong/tree 2>/dev/null | head -1)
-          export PATH="$(brew --prefix llvm)/bin:$PATH"
-          [ -n "$TREE" ] || { echo "::error::no tree"; exit 0; }
-          python3 "$TREE/scripts/build-arm-driver.py" ShengUfs > /tmp/shengufs.out 2>&1
-          RC=$?
-          AR=$(ls -t "$TREE"/build/sheng-ufs/*.a 2>/dev/null | head -1)
-          MEMBERS=$(ar t "$AR" 2>/dev/null | tr '\n' ' ')
-          UNDEF=$(nm -u "$AR" 2>/dev/null | grep -c ' U ')
-          STORAGE=$(nm -u "$AR" 2>/dev/null | grep -c 'IOBlockStorageDevice')
-          NMRAW=$(nm -u "$AR" 2>&1 | head -4 | tr '\n' '|')
-          SIZE=$(wc -c < "$AR" 2>/dev/null || echo 0)
-          echo "::error::ARCH rc=$RC size=$SIZE ar=$AR members=[$MEMBERS] undef=$UNDEF storage=$STORAGE nmraw=[$NMRAW]"
-          tail -4 /tmp/shengufs.out | tr '\n' '|' | sed 's/^/::error::arndrv: /'
-          exit 0
-      - name: Build prelink
-        if: always()
-        working-directory: unixnu
-        run: |
-          TREE=$(ls -d out/shennong/*/shennong/tree 2>/dev/null | head -1)
-          [ -n "$TREE" ] || { echo "::error::no tree for prelink"; exit 0; }
-          ./unixnu build prelink > /tmp/prelink2.out 2>&1
-          RC=$?
-          echo "prelink rc=$RC"
-          tail -25 /tmp/prelink2.out | sed 's/^/::error::/'
-          ls -la out/shennong/*/shennong/kernel/ 2>&1 | head -8 | sed 's/^/::error::/'
-          ls -la "$TREE"/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf 2>&1 | sed 's/^/::error::/'
-          exit 0
-      - name: Probe storage bindings
-        if: always()
-        working-directory: unixnu
-        run: |
-          TREE=$(ls -d out/shennong/*/shennong/tree 2>/dev/null | head -1)
-          export PATH="$(brew --prefix llvm)/bin:$PATH"
-          M=$(ls -t out/shennong/*/shennong/kernel/kernel.macho 2>/dev/null | head -1)
-          [ -n "$M" ] || M=$(ls -t out/shennong/*/payload/stage/EFI/UniXNU/Payloads/kernel.macho 2>/dev/null | head -1)
-          A=$(ls -t "$TREE"/build/sheng-ufs/libShengUfs.a 2>/dev/null | head -1)
-          P=$(dirname "$M")/kernel.json
-          [ -f "$P" ] || P="$M.json"
-          echo "tree=$TREE macho=$M plan=$P archive=$A"
-          [ -n "$TREE" ] || { echo "::error::probe skip: no tree"; exit 0; }
-          [ -f "$M" ] || { echo "::error::probe skip: no kernel.macho"; exit 0; }
-          [ -f "$A" ] || echo "::error::no ShengUfs archive; probe uses the known 11-import list"
-          if ! python3 "$TREE/scripts/shennong-storage-probe.py" --macho "$M" --plan "$P" --archive "$A" --out /tmp/probe.json > /tmp/probe.out 2>&1; then
-            echo "::error::probe crashed"
-            tail -8 /tmp/probe.out | sed 's/^/::error::/'
-            exit 0
-          fi
-          grep '^PROBE ' /tmp/probe.out | head -1 | sed 's/^/::error::/'
-          grep '^MISSING ' /tmp/probe.out | head -8 | sed 's/^/::error::/'
-          cp -f /tmp/probe.json /tmp/probe-keep.json 2>/dev/null || true
-          cd "$GITHUB_WORKSPACE/device"
-          cp -f /tmp/probe-keep.json ci-logs-probe.json 2>/dev/null || true
-          git config user.name ci-bot
-          git config user.email ci-bot@local
-          git checkout -q -B "ci-probe-$GITHUB_RUN_ID" 2>/dev/null || true
-          git add -f ci-logs-probe.json 2>/dev/null || true
-          git commit -q -m "probe run $GITHUB_RUN_ID" 2>/dev/null || echo nothing-to-commit
-          git push --force origin "HEAD:refs/heads/ci-probe-$GITHUB_RUN_ID" 2>/dev/null || echo push-failed
-          exit 0
+        run: ./unixnu build userdata --os "$OS_MAJOR"
+
       - name: Build payload
+        if: contains(inputs.steps, 'payload')
+        working-directory: unixnu
+        run: ./unixnu build payload --os "$OS_MAJOR"
+
+      - name: Preflight (payload size)
+        if: contains(inputs.steps, 'payload')
         working-directory: unixnu
         run: |
-          if ! ./unixnu build payload --uefi "$GITHUB_WORKSPACE/uefi" > /tmp/payload.out 2>&1; then
-            tail -40 /tmp/payload.out | sed 's/^/::error::/'
-            echo "::error::build payload failed"
-            for f in $(ls -t out/shennong/*/*/logs/*.log 2>/dev/null | head -4); do
-              echo "--- $f ($(wc -c < "$f") bytes)"
-              tail -14 "$f" | sed 's/^/::error::/'
-            done
-            for f in out/shennong/*/*/kernel/kernel.macho out/shennong/*/*/payload/payload.img; do
-              [ -f "$f" ] && echo "found $(basename "$f") $(wc -c < "$f") bytes"
-            done
-            exit 1
-          fi
+          set -uo pipefail
+          fail=0
+          found=0
+          for f in out/shennong/*/*/payload/payload.img; do
+            [ -f "$f" ] || continue
+            found=1
+            sz=$(stat -f%z "$f")
+            echo "$f $sz bytes"
+            [ "$sz" = "201326592" ] || { echo "::error::$f is $sz, must be 201326592"; fail=1; }
+          done
+          [ "$found" = 1 ] || { echo "::error::no payload produced"; fail=1; }
+          exit $fail
+
       - name: Patch AppleARMCPU IONameMatch (cpu -> xpu)
-        if: always()
+        if: contains(inputs.steps, 'payload')
         working-directory: unixnu
         run: |
-          set -u
-          PAY=$(ls -t out/shennong/*/shennong/payload/payload.img out/shennong/payload/payload.img 2>/dev/null | head -1)
-          if [ -z "$PAY" ] || [ ! -f "$PAY" ]; then
-            # Build payload already failed the job; do not report a second root cause.
-            echo "::warning::no payload.img to patch"
-            exit 0
-          fi
-          OUT="${PAY%.img}-xpu.img"
-          echo "payload=$PAY bytes=$(wc -c < "$PAY") sha256=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$PAY")"
-          if ! python3 "$GITHUB_WORKSPACE/device/scripts/patch-applearmcpu-ioname.py" \
-                 --payload "$PAY" --out "$OUT" --report "${OUT%.img}.json" > /tmp/ioname.out 2>&1; then
-            tail -25 /tmp/ioname.out | sed 's/^/::error::/'
-            echo "::error::AppleARMCPU IONameMatch patch failed"
-            exit 1
-          fi
-          (grep -E '^(patched|result):' /tmp/ioname.out || tail -6 /tmp/ioname.out) \
-            | sed 's/^/::error::ioname /'
-          if ! python3 "$GITHUB_WORKSPACE/device/scripts/patch-applearmcpu-ioname.py" \
-                 --payload "$OUT" --check > /tmp/ioname2.out 2>&1; then
-            tail -10 /tmp/ioname2.out | sed 's/^/::error::/'
-            echo "::error::patched payload fails the read-only re-check"
-            exit 1
-          fi
-          grep -o '"status": "[a-z-]*"' /tmp/ioname2.out | head -1 | sed 's/^/::error::idempotence /'
-          exit 0
-      - name: Probe kext symbol table
-        if: always()
-        working-directory: unixnu
-        run: |
-          export PATH="$(brew --prefix llvm)/bin:$PATH"
-          TREE=$(ls -d out/shennong/*/shennong/tree 2>/dev/null | head -1)
-          KC=$(ls -t out/ipsw/*/kernelcache.decompressed out/shennong/ipsw/*/kernelcache.decompressed 2>/dev/null | head -1)
-          A=$(ls -t "$TREE"/build/sheng-ufs/libShengUfs.a 2>/dev/null | head -1)
-          echo "kernelcache=$KC archive=$A"
-          ls -d out/ipsw/* 2>/dev/null | head -3
-          [ -n "$TREE" ] || { echo "::error::kext probe skip: no tree"; exit 0; }
-          [ -f "$KC" ] || { echo "::error::kext probe skip: no kernelcache.decompressed"; exit 0; }
-          [ -f "$A" ] || { echo "::error::kext probe skip: no libShengUfs.a"; exit 0; }
-          if ! python3 "$TREE/scripts/shennong-kext-exports-probe.py" "$KC" "$A" > /tmp/kextprobe.out 2>&1; then
-            echo "::error::kext probe crashed"
-            tail -15 /tmp/kextprobe.out | sed 's/^/::error::/'
-            exit 0
-          fi
-          tail -20 /tmp/kextprobe.out | sed 's/^/::error::/'
-      - name: Upload kernel
+          PAY=$(ls -t out/shennong/*/*/payload/payload.img 2>/dev/null | head -1)
+          test -n "$PAY"
+          python3 "$GITHUB_WORKSPACE/device/scripts/patch-applearmcpu-ioname.py" \
+            --payload "$PAY" --out "${PAY%.img}-xpu.img"
+          python3 "$GITHUB_WORKSPACE/device/scripts/patch-applearmcpu-ioname.py" \
+            --payload "${PAY%.img}-xpu.img" --check
+
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shennong-kernel-${{ github.run_attempt }}
+          name: shennong-${{ inputs.os_major }}-${{ github.run_attempt }}
+          retention-days: 5
           if-no-files-found: warn
-          retention-days: 7
           path: |
-            unixnu/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837*
-            unixnu/out/shennong/kernel/kernel.macho*
-            unixnu/out/shennong/payload/payload.img
-            unixnu/out/shennong/*/shennong/payload/payload.img
-            unixnu/out/shennong/*/shennong/payload/payload-xpu.img
-            unixnu/out/shennong/*/shennong/payload/payload-xpu.json
-            unixnu/out/shennong/*/shennong/payload/payload.json
-            unixnu/out/shennong/*/shennong/kernel/kernel.macho*
-            unixnu/out/shennong/payload/payload.json
-            unixnu/out/shennong/logs/*.log
+            unixnu/out/shennong/*/*/payload/payload-xpu.img
+            unixnu/out/shennong/*/*/payload/payload.img
+            unixnu/out/shennong/*/*/payload/payload.json
+            unixnu/out/shennong/*/*/kernel/kernel.macho*
             unixnu/out/shennong/*/*/logs/*.log
-  logs:
-    needs: kernel
-    if: always()
-    runs-on: ubuntu-24.04
-    steps:
-      - run: echo "kernel job finished"
 
+      - name: Summary
+        if: always()
+        working-directory: unixnu
+        run: |
+          {
+            echo "## shennong build (OS ${{ inputs.os_major }}, ${{ inputs.steps }})"
+            echo '```'
+            ls -l out/shennong/*/*/payload/payload*.img 2>/dev/null || echo "no payload"
+            ls -l out/shennong/*/*/kernel/kernel.macho* 2>/dev/null || echo "no kernel"
+            ls out/shennong/*/*/logs 2>/dev/null | head -30
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
