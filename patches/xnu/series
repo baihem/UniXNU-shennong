@@ -1,2 +1,1 @@
-# Board patch paths, one per line in application order.
-zzzz-diag-marks.patch
+# device patch series (none for xnu-12377; diagnostics live in the soc series)
