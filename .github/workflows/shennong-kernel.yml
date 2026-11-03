@@ -101,28 +101,24 @@ jobs:
           set -euo pipefail
           cd device
           grep -n 'patch_series' board.toml || true
+          grep -n -A8 '"archives"' board.toml || true
+          mkdir -p patches/xnu-12377
+          # series (patch names, one per line)
           if [ ! -f patches/xnu-12377/series ]; then
-            echo "::warning::device repo has no patches/xnu-12377/series; deriving it from patches/xnu/series"
-            mkdir -p patches/xnu-12377
-            rc=0
-            while IFS= read -r line; do
-              line="${line%%$'\r'}"
-              case "$line" in ''|'#'*) continue;; esac
-              echo "  series entry: $line"
-              src=""
-              for cand in "patches/xnu-12377/$line" "patches/xnu/$line" "$line"; do
-                if [ -f "$cand" ]; then src="$cand"; break; fi
-              done
-              if [ -z "$src" ]; then
-                echo "::error::series references '$line' but the file is nowhere in the device repo"
-                rc=1
-                continue
-              fi
-              cp "$src" "patches/xnu-12377/$line"
-            done < patches/xnu/series
-            [ "$rc" = 0 ] || exit 1
             cp patches/xnu/series patches/xnu-12377/series
+            echo "::warning::no patches/xnu-12377/series in the device repo; copied patches/xnu/series"
           fi
+          for line in $(grep -vE '^#|^$' patches/xnu-12377/series); do
+            if [ ! -f "patches/xnu-12377/$line" ]; then
+              if [ -f "patches/xnu/$line" ]; then
+                cp "patches/xnu/$line" "patches/xnu-12377/$line"
+                echo "::warning::copied $line from patches/xnu/ into patches/xnu-12377/"
+              else
+                echo "::error::$line is listed in patches/xnu-12377/series but nowhere in the device repo"
+                exit 1
+              fi
+            fi
+          done
           echo "--- patches/xnu-12377/series"
           cat patches/xnu-12377/series
           for f in patches/xnu-12377/*.patch; do
@@ -264,9 +260,9 @@ jobs:
           set -uo pipefail
           # The archive builders run before the kernel links, so a builder that cannot read
           # arm64e objects fails the whole build. Report every builder before building.
-          for f in scripts/build-sheng-platform-power.py scripts/build-mockfs-fixture.py \
-                   scripts/build-corecrypto-14.py scripts/build-libpthread-kernel.py; do
-            [ -f "$f" ] || { echo "absent: $f"; continue; }
+          for f in scripts/build-mockfs-fixture.py scripts/build-corecrypto-14.py \
+                   scripts/build-libpthread-kernel.py scripts/build-sheng-platform-power.py; do
+            [ -f "$f" ] || { echo "absent (not needed, the archive step is skipped): $f"; continue; }
             hits=$(grep -nE "0x100000c|subtype|feedfacf" "$f" || true)
             if [ -n "$hits" ]; then
               echo "--- $f"; echo "$hits" | sed 's/^/    /'
@@ -297,10 +293,30 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: ./unixnu build kernel --os "$OS_MAJOR"
 
-      - name: Build userdata
-        if: contains(inputs.steps, 'userdata')
+      - name: Preflight the kernel link symbols
+        if: always()
         working-directory: unixnu
-        run: ./unixnu build userdata --os "$OS_MAJOR"
+        run: |
+          set -uo pipefail
+          # Fail fast: check the kernel objects that the bootstrap pass has already compiled
+          # for the two symbols the final link needs from the board archives.
+          OBJ=out/shennong/*/*/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837
+          ls -d $OBJ >/dev/null 2>&1 || { echo "no object directory yet (bootstrap pass produced nothing)"; exit 0; }
+          if command -v llvm-nm >/dev/null 2>&1; then NM=llvm-nm; else NM=nm; fi
+          have() { $NM -g $(find $OBJ -name '*.o' 2>/dev/null) 2>/dev/null | grep -qE " T _?$1\$"; }
+          printf 'XNU_SHENG_PMGR=%s  XNU_NATIVE_UFS=%s  XNU_SOURCE_MOCKFS=%s  XNU_BOOT_PROGRESS=%s\n' \
+            "${XNU_SHENG_PMGR:-unset}" "${XNU_NATIVE_UFS:-unset}" "${XNU_SOURCE_MOCKFS:-unset}" "${XNU_BOOT_PROGRESS:-unset}"
+          for sym in sheng_pmgr_run sheng_ufs_probe_bind; do
+            if have "$sym"; then echo "defined by the kernel objects: $sym"; else echo "not in the kernel objects: $sym (must come from an archive)"; fi
+          done
+          ls -l out/shennong/*/*/tree/build/sheng-platform-power/libShengPlatformPower.a 2>/dev/null || echo "archive libShengPlatformPower.a: absent (no archive step builds it)"
+          ls -d out/shennong/*/*/tree/build/sheng-ufs out/shennong/*/*/tree/build/mockfs-fixture 2>/dev/null || true
+          for cfg in out/shennong/*/*/shennong/.config; do
+            [ -f "$cfg" ] || continue
+            echo "--- $cfg"
+            grep -E '^CONFIG_XNU_(NATIVE_UFS|SHENG_PMGR|SOURCE_MOCKFS|BOOT_PROGRESS|SOURCE_PTHREAD|SOURCE_CORECRYPTO14)=' "$cfg" | sort
+          done
+          exit 0
 
       - name: Build payload
         if: contains(inputs.steps, 'payload')
